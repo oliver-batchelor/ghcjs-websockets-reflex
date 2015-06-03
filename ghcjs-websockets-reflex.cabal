@@ -1,0 +1,32 @@
+name:                ghcjs-websockets-reflex
+version:             0.1
+synopsis:            Reflex FRP wrapper interface for GHCJS-WebSockets 
+description:
+license:             BSD3
+license-file:        LICENSE
+author:              Oliver Batchelor
+category:            Game
+build-type:          Simple
+-- extra-source-files:  
+cabal-version:       >=1.10
+
+
+library
+  exposed-modules:   JavaScript.WebSockets.Reflex.WebSocket
+  hs-source-dirs: src
+  build-depends:
+    base,
+    reflex, 
+    reflex-dom, 
+    ghcjs-websockets,
+    containers,
+    transformers,
+    text,
+    lens,
+    binary
+
+    
+  default-extensions: GeneralizedNewtypeDeriving, DeriveGeneric, RecursiveDo, ScopedTypeVariables, FlexibleContexts, TupleSections, RankNTypes
+
+  
+
