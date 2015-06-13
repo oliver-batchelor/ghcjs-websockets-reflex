@@ -1,33 +1,39 @@
-{-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE ScopedTypeVariables, TypeFamilies #-}
 
 module JavaScript.WebSockets.Reflex.WebSocket 
   ( openConnection
-  , holdConnection
+  , checkDisconnected
   
   , receiveMessage
-  , receive
+  , receiveMessages
+  
+  , disconnected
+  , unwrapReceivable
+  
+  , decodeMessage
+  , textMessage
 
-  
-  , receiveMessageOnce
-  , receiveOnce
-  
-  , sendMessage      
+  , sendMessage
   , send
   
-  , SocketEvents(..)
+  , switchEvents
+  , iterateEvent
 
-  , closeConnection   
-  , closeConnections
+  , SocketMsg(..)
+  , WSReceivable
+  , WSSendable
   
   , Connection
-  , ConnClosing (..)
-  , SocketMsg (..)
+  , ConnClosing
+  
   )
   where
 
 
 import Reflex
 import Reflex.Dom
+import Control.Monad.Ref
+
 
 import Reflex.Dom.Class
 import Reflex.Host.Class
@@ -39,11 +45,13 @@ import Control.Lens
 import Control.Concurrent
 import Data.Text (Text)
 import Data.Maybe
+import Data.Tuple (swap)
 
 import Data.Binary  
 
 import Data.Foldable 
 import Data.Traversable
+import Data.Functor
 
 import Control.Concurrent 
 
@@ -55,182 +63,138 @@ import JavaScript.WebSockets (ConnClosing, Connection, SocketMsg, WSReceivable, 
 
 
 -- Utility functions
-
-
--- Wrapper for performEventAsync where the function is called in another thread
-forkEventAsync :: MonadWidget t m => Event t a -> (a -> (b -> IO ()) -> IO ()) -> m (Event t b)
-forkEventAsync e f = performEventAsync $ ffor e $ \a cb -> liftIO $ do 
+  
+forkEventAsync' :: MonadWidget t m =>  (a -> (b -> IO ()) -> IO ()) ->  Event t a -> m (Event t b)
+forkEventAsync' f e = performEventAsync $ ffor e $ \a cb -> liftIO $ do 
     void $ forkIO $ f a cb
     
 
-    
-performAsync ::  MonadWidget t m => Event t a -> (a -> IO b) -> m (Event t b)
-performAsync e f = forkEventAsync e (\a cb -> f a >>= cb) 
+forkEventAsync ::  MonadWidget t m => (a -> IO b) -> Event t a ->  m (Event t b)
+forkEventAsync f = forkEventAsync' (\a cb -> f a >>= cb) 
 
+generateAsync ::  (MonadWidget t m) => (a -> IO b) -> a -> m (Event t b)
+generateAsync f a = once a >>= forkEventAsync f
 
--- Filter event stream with predicate and return ()
-whenE_ :: (Reflex t) => (a -> Bool) -> Event t a -> Event t () 
-whenE_ f = fmap (const ()) . ffilter f 
 
 -- Split Either into two event streams
 splitEither :: (Reflex t) => Event t (Either a b) -> (Event t a, Event t b)
 splitEither e = (fmapMaybe (firstOf _Left) e, fmapMaybe (firstOf _Right) e)
 
 
--- Attach an event with it's previous value
-history :: MonadWidget t m => Event t a -> m (Event t (Maybe a, a))
-history event = do 
-  value <- hold Nothing (fmap Just event)
-  return $ attach value event
+catMaybesE :: (Reflex t) => Event t (Maybe a) -> Event t a
+catMaybesE = fmapMaybe id
+
+tagConst :: (Reflex t) => a -> Event t b -> Event t a
+tagConst a = fmap (const a) 
+
+
+unTag :: (Reflex t) => Event t a -> Event t ()
+unTag = fmap (const ())
+
+once :: (MonadWidget t m) => a -> m (Event t a) 
+once a = do
+  postBuild <- getPostBuild    
+  return (fmap (const a) postBuild) 
+
+
+
+splitMaybe :: (Reflex t) => Event t (Maybe a) -> (Event t (), Event t a)
+splitMaybe e = (unTag $ ffilter isNothing e, catMaybesE e)
   
-
-counter :: MonadWidget t m => Event t a -> m (Dynamic t Int)
-counter event = foldDyn (+) 0 (fmap (const 1) event)
-
-
   
-delay :: MonadWidget t m => Int -> Event t a -> m (Event t a)
-delay n event = performAsync event (\a -> threadDelay n >> return a)
+-- |Given a function f which generates an event stream given an 'a',
+-- |upgrade it to a function which takes an event stream of 'a' and switches
+-- |to a the event stream for each input 'a'.
+switchEvents :: MonadWidget t m => (a -> m (Event t b)) -> Event t a -> m (Event t b)
+switchEvents f e = fmap switchPromptlyDyn $ widgetHold (return never) (f <$> e) 
+ 
 
-
-splitEvents :: (Reflex t) => Event t Int -> Event t (Int, a) -> Event t (Event t a)
-splitEvents ids events = fmap (\i -> fmap snd $ ffilter ((==i) . fst) events) ids   
-
-
-switchEvents :: (MonadWidget t m) => Event t Int -> Event t (Int, a) -> m (Event t a)
-switchEvents ids events = switchPromptly never (splitEvents ids events)
-
-
-iterateAsync :: (MonadWidget t m) => Event t a ->  (a -> IO (Maybe (a, b))) -> m (Event t b)  
-iterateAsync trigger f = do
-  
+-- |Iterate an event generator, every time an event is recieved
+-- |feed the input back to itself.
+-- |Note: the input generator must be delayed, e.g. the result of a performEventAsync
+iterateEvent :: MonadWidget t m => (Event t a -> m (Event t a)) -> Event t a -> m (Event t a)
+iterateEvent f e = do
   rec
-    count <- counter trigger 
-    event <- performAsync (attachDyn count $ leftmost [trigger, fmap fst result])  f'
-    result <- fmap (fmapMaybe id) $ switchEvents (updated count) event
-    
-  return (fmap snd result)
-  
-  where
-    f' (i, a) = f a >>= \a' -> return (i, a')
-    
-repeatAsync :: (MonadWidget t m) => Event t a -> (a -> IO b) -> m (Event t b)  
-repeatAsync trigger f = iterateAsync trigger f' 
-  where
-    f' a = f a >>= \b -> return $ Just (a, b)
+    next <- f $ leftmost [e, next]
+  return next     
 
-  
-tickOn :: (MonadWidget t m, Show a) => Int -> Event t a -> m (Event t a)
-tickOn n trigger = repeatAsync trigger $ (\a -> threadDelay n  >> return a)
-  
+        
+delay :: MonadWidget t m => Int -> Event t a -> m (Event t a)
+delay ms = forkEventAsync (\a -> threadDelay ms >> return a) 
+
 
 tick :: MonadWidget t m => Int -> m (Event t ())
-tick n = getPostBuild >>= tickOn n
-
-
+tick ms = getPostBuild >>= iterateEvent (delay ms)
+        
  
---Open connections for each url provided
-openConnection :: MonadWidget t m => Event t Text -> m (Event t Connection)
-openConnection request = forkEventAsync request  $ \url cb -> do
-      WS.openConnection url >>= cb
+-- |Open a connection
+-- |Can be upgraded to operate on an event of Urls
+-- |switchEvents openConnection :: Event Text -> m (Event t Connection)
+openConnection :: MonadWidget t m => Text -> m (Event t Connection)
+openConnection = generateAsync WS.openConnection
       
       
-holdConnection :: MonadWidget t m => Event t Text -> m (Dynamic t (Maybe Connection))
-holdConnection request = do
-  open <- openConnection request
-  holdDyn Nothing (fmap Just open)
+      
+-- |Receieve one message for each incoming Connection event.      
+receiveMessage :: MonadWidget t m => Event t Connection ->  m (Event t (Maybe SocketMsg))
+receiveMessage = forkEventAsync WS.receiveMessageMaybe
+
+
+-- |Repeatedly receive messages from a given Connection.
+-- |Can be upgraded to take an Event of Connections and switch to the new Connection when received.
+-- |switchEvents receiveMessages :: Event Connection -> m (Event t (Maybe SocketMsg))
+receiveMessages :: MonadWidget t m => Connection -> m (Event t (Maybe SocketMsg))
+receiveMessages conn = do
+  rec
+    initial <- once conn
+    e <- receiveMessage $ leftmost [tagConst conn $ catMaybesE e, initial]
+  return e
+
+-- |Disconnected event from message event.
+disconnected :: Reflex t => Event t (Maybe SocketMsg) -> Event t ()
+disconnected = unTag . ffilter isNothing
+
+
+-- |Unwrap an event from message event, using the ghcjs_websockets WSReceivable
+-- |Has instances for all Binary a and Text
+-- |returns two events, successfully unwrapped messages and messages which could not be decoded
+unwrapReceivable :: (WSReceivable a, Reflex t) => Event t (Maybe SocketMsg) -> (Event t a, Event t SocketMsg)
+unwrapReceivable  = swap . splitEither . fmap WS.unwrapReceivable . catMaybesE
+    
+-- |Decode a binary SocketMsg using the Binary class
+-- |returns two events, successfully decoded messages and messages which could not be decoded  
+decodeMessage :: (Binary a, Reflex t) => Event t (Maybe SocketMsg) -> (Event t a, Event t SocketMsg)  
+decodeMessage = unwrapReceivable
+
+
+-- |Unwrap a text SocketMsg
+-- |returns two events, messages which are Text, and messages are binary  
+-- | e.g.  fst . textMessage <$> receiveMessages conn :: m (Event t Text) 
+-- | 
+textMessage :: (Reflex t) => Event t (Maybe SocketMsg) -> (Event t Text, Event t SocketMsg)  
+textMessage = unwrapReceivable
+
   
-  
--- Periodically check the latest connection is still open
--- Event is triggered when a connection is lost
-pollConnection :: MonadWidget t m => Int -> Event t Connection -> m (Event t WS.ConnClosing)
-pollConnection microSeconds conn = do 
+-- |Periodically check the latest connection is still open,
+-- |the event is triggered when a connection is lost.
+checkDisconnected :: MonadWidget t m => Int -> Connection -> m (Event t WS.ConnClosing)
+checkDisconnected microSeconds conn = do 
   poll <- tick microSeconds
-  fmap (fmapMaybe id) $ performConnection checkClosed conn poll
+  e <- performEvent $ ffor poll (const $ liftIO $ WS.connectionCloseReason conn)
+  return (catMaybesE e)
   
-  where
-    checkClosed conn () = WS.connectionCloseReason conn
-    
-    
---Receieve messages using the latest connection     
-receiveMessage :: (MonadWidget t m) => Event t Connection -> m (Event t (Maybe SocketMsg))
-receiveMessage conn = iterateAsync (fmap Just conn) $ 
 
-  -- On the first time through a Nothing message is returned (and Nothing connection), second time Nothing for the whole
-  traverse $ \conn' -> do 
-    msg  <- WS.receiveMessageMaybe conn'
-    return (fmap (const conn') msg, msg)    
-      
+-- | Send messages to a connection.
+-- | arguments are ordered this way so that one might use switchEvents e.g.
+-- | switchEvents (sendMessage msg) :: Event Connection -> m (Event t ())  
+-- | returns an Event for the success/failure of sending.
+sendMessage :: (MonadWidget t m) =>  Event t SocketMsg -> Connection -> m (Event t Bool)
+sendMessage msg conn = performEvent $ ffor msg $ liftIO . WS.sendMessage conn
+  
 
-
-      
---Record type for labelling the various events returned
-data SocketEvents t a = SocketEvents
-  { socket_message      :: Event t a
-  , socket_disconnected :: Event t ()
-  , socket_decodeFail   :: Event t SocketMsg 
-  }
-      
-      
-
-            
---using the ghcjs-websockets WSReceivable class decode a socket message
-unwrapReceivable :: forall t a. (Reflex t, WSReceivable a) => Event t (Maybe SocketMsg) -> SocketEvents t a
-unwrapReceivable msgEvent = SocketEvents (snd dfm) disc (fst dfm) where
-    disc = fmap (const ()) $ ffilter isNothing msgEvent
-    
-    dfm :: (Event t SocketMsg, Event t a)
-    dfm = splitEither $ fmap WS.unwrapReceivable (fmapMaybe id msgEvent)
-
-    
-    
-    
---Main receive API functions, returns SocketEvents record
-receive  :: (MonadWidget t m, WSReceivable a) => Event t Connection -> m (SocketEvents t a)
-receive = fmap unwrapReceivable . receiveMessage 
-
-
-receiveMessageOnce  :: (MonadWidget t m) => Event t Connection -> m (Event t (Maybe SocketMsg))
-receiveMessageOnce conn =  performAsync conn (WS.receiveMessageMaybe)
-
-receiveOnce  :: (MonadWidget t m, WSReceivable a) => Event t Connection -> m (SocketEvents t a)
-receiveOnce = fmap unwrapReceivable . receiveMessageOnce
-
-
-performConnection :: (MonadWidget t m) => (Connection -> a -> IO b) ->  Event t Connection -> Event t a -> m (Event t b)
-performConnection f conn event = do 
-    latest <- holdDyn Nothing (fmap Just conn)
-    e <- performEvent $ fmap perform (attachDyn latest event)
-    return $ fmapMaybe id e  
-      
-    where  
-      perform (mayConn, a) = liftIO $ for mayConn $ \conn -> f conn a
-
-
-performConnection_ :: (MonadWidget t m) => (Connection -> a -> IO b) ->  Event t Connection -> Event t a -> m ()
-performConnection_ f conn event = do 
-    latest <- holdDyn Nothing (fmap Just conn)
-    performEvent_ $ fmap perform (attachDyn latest event)
-      
-    where  
-      perform (mayConn, a) = liftIO $ for_ mayConn $ \conn -> void $ f conn a
-      
-      
-sendMessage :: (MonadWidget t m) =>  Event t Connection -> Event t SocketMsg -> m ()
-sendMessage = performConnection_ WS.sendMessage
-
-
-send :: (MonadWidget t m, WSSendable a) =>  Event t Connection  -> Event t a -> m ()
-send = performConnection_ WS.send
-
-closeConnection :: (MonadWidget t m) =>  Event t Connection -> Event t () -> m ()
-closeConnection = performConnection_ (\conn () -> WS.closeConnection conn)
-    
-
--- Close old connections, leaving only the most recently received connection open
-closeConnections :: (MonadWidget t m) =>  Event t Connection ->  m ()   
-closeConnections conn =  do
-  prev <- hold Nothing (fmap Just conn)
-  performEvent_ $ ffor (fmapMaybe id $ tag prev conn) $ liftIO . WS.closeConnection
+-- | Send messages to a connection using WSSendable.
+-- | instances for all Binary a and Text  
+send :: (WSSendable a, MonadWidget t m) =>  Event t a -> Connection -> m (Event t Bool)
+send a conn = performEvent $ ffor a $ liftIO . WS.send conn
 
  
