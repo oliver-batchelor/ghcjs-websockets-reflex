@@ -18,7 +18,6 @@ module JavaScript.WebSockets.Reflex.WebSocket
   , WS.unwrapReceivable
 
   , sendMessage
-  , sendMessage2 
   , send
   
   , switchEvents
