@@ -37,8 +37,6 @@ module JavaScript.WebSockets.Reflex.WebSocket
 
 import Reflex
 import Reflex.Dom
-import Control.Monad.Ref
-
 
 import Reflex.Dom.Class
 import Reflex.Host.Class
