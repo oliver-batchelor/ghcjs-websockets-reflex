@@ -22,11 +22,11 @@ library
     containers,
     transformers,
     text,
+    bytestring,
     lens,
     binary
-
-    
   default-extensions: GeneralizedNewtypeDeriving, DeriveGeneric, RecursiveDo, ScopedTypeVariables, FlexibleContexts, TupleSections, RankNTypes
+
 
   
 

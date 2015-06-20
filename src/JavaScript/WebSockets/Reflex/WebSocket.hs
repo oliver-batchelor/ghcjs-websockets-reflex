@@ -8,12 +8,17 @@ module JavaScript.WebSockets.Reflex.WebSocket
   , receiveMessages
   
   , disconnected
-  , unwrapReceivable
+  , unwrapEvents
+  , unwrapWith
+
   
   , decodeMessage
   , textMessage
+      
+  , WS.unwrapReceivable
 
   , sendMessage
+  , sendMessage2 
   , send
   
   , switchEvents
@@ -43,7 +48,11 @@ import Control.Monad.IO.Class
 import Control.Lens
 
 import Control.Concurrent
+
 import Data.Text (Text)
+import Data.ByteString.Lazy  (ByteString, fromStrict, toStrict)
+
+
 import Data.Maybe
 import Data.Tuple (swap)
 
@@ -62,6 +71,8 @@ import qualified JavaScript.WebSockets.Internal as WS
 import JavaScript.WebSockets (ConnClosing, Connection, SocketMsg, WSReceivable, WSSendable)
 
 
+
+
 -- Utility functions
   
 forkEventAsync' :: MonadWidget t m =>  (a -> (b -> IO ()) -> IO ()) ->  Event t a -> m (Event t b)
@@ -74,6 +85,11 @@ forkEventAsync f = forkEventAsync' (\a cb -> f a >>= cb)
 
 generateAsync ::  (MonadWidget t m) => (a -> IO b) -> a -> m (Event t b)
 generateAsync f a = once a >>= forkEventAsync f
+
+generate ::  (MonadWidget t m) => (a -> IO b) -> a -> m (Event t b)
+generate f a = do
+  e <- once a 
+  performEvent $ fmap (liftIO . f) e
 
 
 -- Split Either into two event streams
@@ -131,7 +147,7 @@ tick ms = getPostBuild >>= iterateEvent (delay ms)
 -- |Can be upgraded to operate on an event of Urls
 -- |switchEvents openConnection :: Event Text -> m (Event t Connection)
 openConnection :: MonadWidget t m => Text -> m (Event t Connection)
-openConnection = generateAsync WS.openConnection
+openConnection = generate WS.openConnection
       
       
       
@@ -145,10 +161,10 @@ receiveMessage = forkEventAsync WS.receiveMessageMaybe
 -- |switchEvents receiveMessages :: Event Connection -> m (Event t (Maybe SocketMsg))
 receiveMessages :: MonadWidget t m => Connection -> m (Event t (Maybe SocketMsg))
 receiveMessages conn = do
-  rec
-    initial <- once conn
-    e <- receiveMessage $ leftmost [tagConst conn $ catMaybesE e, initial]
-  return e
+--   rec
+--     initial <- once conn
+--     e <- receiveMessage $ leftmost [const conn <$> catMaybesE e, initial]
+  return never
 
 -- |Disconnected event from message event.
 disconnected :: Reflex t => Event t (Maybe SocketMsg) -> Event t ()
@@ -158,13 +174,24 @@ disconnected = unTag . ffilter isNothing
 -- |Unwrap an event from message event, using the ghcjs_websockets WSReceivable
 -- |Has instances for all Binary a and Text
 -- |returns two events, successfully unwrapped messages and messages which could not be decoded
-unwrapReceivable :: (WSReceivable a, Reflex t) => Event t (Maybe SocketMsg) -> (Event t a, Event t SocketMsg)
-unwrapReceivable  = swap . splitEither . fmap WS.unwrapReceivable . catMaybesE
+unwrapEvents :: (WSReceivable a, Reflex t) =>  Event t (Maybe SocketMsg) -> (Event t a, Event t SocketMsg)
+unwrapEvents  = swap . splitEither . fmap WS.unwrapReceivable . catMaybesE
+
+
+unwrapMaybe :: (SocketMsg -> Maybe a) -> SocketMsg -> Either SocketMsg a
+unwrapMaybe f m = case f m of
+    Nothing   -> Left m
+    Just   a  -> Right a
+
+
+unwrapWith :: Reflex t => (SocketMsg -> Maybe a) ->  Event t (Maybe SocketMsg) -> (Event t a, Event t SocketMsg)
+unwrapWith f = swap . splitEither . fmap (unwrapMaybe f) . catMaybesE
+
     
 -- |Decode a binary SocketMsg using the Binary class
 -- |returns two events, successfully decoded messages and messages which could not be decoded  
 decodeMessage :: (Binary a, Reflex t) => Event t (Maybe SocketMsg) -> (Event t a, Event t SocketMsg)  
-decodeMessage = unwrapReceivable
+decodeMessage = unwrapEvents
 
 
 -- |Unwrap a text SocketMsg
@@ -172,9 +199,9 @@ decodeMessage = unwrapReceivable
 -- | e.g.  fst . textMessage <$> receiveMessages conn :: m (Event t Text) 
 -- | 
 textMessage :: (Reflex t) => Event t (Maybe SocketMsg) -> (Event t Text, Event t SocketMsg)  
-textMessage = unwrapReceivable
+textMessage = unwrapEvents
 
-  
+
 -- |Periodically check the latest connection is still open,
 -- |the event is triggered when a connection is lost.
 checkDisconnected :: MonadWidget t m => Int -> Connection -> m (Event t WS.ConnClosing)
@@ -196,5 +223,6 @@ sendMessage msg conn = performEvent $ ffor msg $ liftIO . WS.sendMessage conn
 -- | instances for all Binary a and Text  
 send :: (WSSendable a, MonadWidget t m) =>  Event t a -> Connection -> m (Event t Bool)
 send a conn = performEvent $ ffor a $ liftIO . WS.send conn
+
 
  

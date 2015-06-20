@@ -5,6 +5,7 @@
     transformers,
     containers,
     text,
+    bytestring, 
     lens,
     binary
 }:
@@ -21,8 +22,10 @@ mkDerivation {
     containers
     transformers
     text
+    bytestring
     lens
     binary
+    
   ];
   license = null;
 }
