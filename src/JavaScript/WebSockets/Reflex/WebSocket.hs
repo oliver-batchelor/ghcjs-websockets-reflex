@@ -133,12 +133,12 @@ iterateEvent f e = do
   return next     
 
         
-delay :: MonadWidget t m => Int -> Event t a -> m (Event t a)
-delay ms = forkEventAsync (\a -> threadDelay ms >> return a) 
+delayMs :: MonadWidget t m => Int -> Event t a -> m (Event t a)
+delayMs ms = forkEventAsync (\a -> threadDelay ms >> return a) 
 
 
 tick :: MonadWidget t m => Int -> m (Event t ())
-tick ms = getPostBuild >>= iterateEvent (delay ms)
+tick ms = getPostBuild >>= iterateEvent (delayMs ms)
         
  
 -- |Open a connection
